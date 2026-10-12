@@ -1,10 +1,10 @@
 import { ProxyParser } from '../parsers/index.js';
-import { deepCopy, tryDecodeSubscriptionLines, decodeBase64 } from '../utils.js';
+import { createStableProviderName, deepCopy, tryDecodeSubscriptionLines, decodeBase64 } from '../utils.js';
 import { createTranslator } from '../i18n/index.js';
 import { generateRules, getOutbounds, PREDEFINED_RULE_SETS } from '../config/index.js';
 
 export class BaseConfigBuilder {
-    constructor(inputString, baseConfig, lang, userAgent, groupByCountry = false) {
+    constructor(inputString, baseConfig, lang, userAgent, groupByCountry = false, includeAutoSelect = true) {
         this.inputString = inputString;
         this.config = deepCopy(baseConfig);
         this.customRules = [];
@@ -13,6 +13,10 @@ export class BaseConfigBuilder {
         this.userAgent = userAgent;
         this.appliedOverrideKeys = new Set();
         this.groupByCountry = groupByCountry;
+        this.includeAutoSelect = includeAutoSelect;
+        this.providerUrls = [];  // URLs to use as providers (auto-sync)
+        this.autoProviderDescriptors = undefined;
+        this.subscriptionUserinfo = undefined;
     }
 
     async build() {
@@ -80,6 +84,63 @@ export class BaseConfigBuilder {
             }
 
             for (const processedUrl of processedUrls) {
+                const trimmedUrl = typeof processedUrl === 'string' ? processedUrl.trim() : '';
+
+                // Check if it's an HTTP(S) URL - may use as provider if format matches
+                if (trimmedUrl.startsWith('http://') || trimmedUrl.startsWith('https://')) {
+                    const { fetchSubscriptionWithFormat } = await import('../parsers/subscription/httpSubscriptionFetcher.js');
+
+                    try {
+                        const fetchResult = await fetchSubscriptionWithFormat(trimmedUrl, this.userAgent);
+                        if (fetchResult) {
+                            const { content, format, url: originalUrl, subscriptionUserinfo } = fetchResult;
+
+                            if (subscriptionUserinfo && !this.subscriptionUserinfo) {
+                                this.subscriptionUserinfo = subscriptionUserinfo;
+                            }
+
+                            // If format is compatible with target client, use as provider
+                            if (this.isCompatibleProviderFormat(format)) {
+                                this.providerUrls.push(originalUrl);
+                                continue;  // Skip parsing, will be used as provider
+                            }
+
+                            // Otherwise parse the content as usual
+                            const result = parseSubscriptionContent(content);
+                            if (result && typeof result === 'object' && (result.type === 'yamlConfig' || result.type === 'singboxConfig' || result.type === 'surgeConfig')) {
+                                if (result.config) {
+                                    this.applyConfigOverrides(result.config);
+                                }
+                                if (Array.isArray(result.proxies)) {
+                                    result.proxies.forEach(proxy => {
+                                        if (proxy && typeof proxy === 'object' && proxy.tag) {
+                                            parsedItems.push(proxy);
+                                        }
+                                    });
+                                }
+                                continue;
+                            }
+                            // Handle array of URIs or other formats
+                            if (Array.isArray(result)) {
+                                for (const item of result) {
+                                    if (item && typeof item === 'object' && item.tag) {
+                                        parsedItems.push(item);
+                                    } else if (typeof item === 'string') {
+                                        const subResult = await ProxyParser.parse(item, this.userAgent);
+                                        if (subResult) {
+                                            parsedItems.push(subResult);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    } catch (error) {
+                        console.error('Error processing HTTP subscription:', error);
+                    }
+                    continue;
+                }
+
+                // Non-HTTP URLs (protocol URIs like ss://, vmess://, etc.)
                 const result = await ProxyParser.parse(processedUrl, this.userAgent);
                 // Handle yamlConfig, singboxConfig, and surgeConfig types (they have the same structure)
                 if (result && typeof result === 'object' && (result.type === 'yamlConfig' || result.type === 'singboxConfig' || result.type === 'surgeConfig')) {
@@ -115,15 +176,63 @@ export class BaseConfigBuilder {
         return parsedItems;
     }
 
+    /**
+     * Check if subscription format is compatible for use as a provider
+     * Override in child classes to enable provider support
+     * @param {'clash'|'singbox'|'unknown'} format - Detected subscription format
+     * @returns {boolean} - True if format can be used as provider
+     */
+    isCompatibleProviderFormat(format) {
+        return false;  // Default: no provider support
+    }
+
+    getAutoProviderDescriptors(reservedNames = []) {
+        if (this.autoProviderDescriptors) {
+            return this.autoProviderDescriptors;
+        }
+
+        const usedNames = new Set(reservedNames);
+        const providerNamesByUrl = new Map();
+        const descriptors = [];
+
+        for (const url of this.providerUrls) {
+            if (typeof url !== 'string' || url.trim() === '') {
+                throw new Error('Provider URL must be a non-empty string');
+            }
+
+            const normalizedUrl = url.trim();
+            if (providerNamesByUrl.has(normalizedUrl)) {
+                continue;
+            }
+
+            const baseName = createStableProviderName(normalizedUrl);
+            let name = baseName;
+            let suffix = 2;
+
+            while (usedNames.has(name)) {
+                name = `${baseName}_${suffix}`;
+                suffix += 1;
+            }
+
+            usedNames.add(name);
+            providerNamesByUrl.set(normalizedUrl, name);
+            descriptors.push({ name, url: normalizedUrl });
+        }
+
+        this.autoProviderDescriptors = descriptors;
+        return descriptors;
+    }
+
     applyConfigOverrides(overrides) {
         if (!overrides || typeof overrides !== 'object') {
             return;
         }
 
-        // Allow incoming Clash YAML to override most fields, including 'proxy-groups'.
-        // Still block 'proxies' (handled by dedicated parser), and keep ignoring
-        // 'rules' and 'rule-providers' which are generated by our own logic.
-        const blacklistedKeys = new Set(['proxies', 'rules', 'rule-providers']);
+        // Block keys that are handled specially:
+        // - 'proxies': handled by dedicated parser
+        // - 'rules', 'rule-providers': generated by our own logic
+        // - 'proxy-groups': stored for later intelligent merge (not direct override)
+        const blacklistedKeys = new Set(['proxies', 'rules', 'rule-providers', 'proxy-groups']);
 
         Object.entries(overrides).forEach(([key, value]) => {
             if (blacklistedKeys.has(key)) {
@@ -132,15 +241,64 @@ export class BaseConfigBuilder {
             if (value === undefined) {
                 delete this.config[key];
                 this.appliedOverrideKeys.add(key);
+            } else if (key === 'dns' && typeof value === 'object' && !Array.isArray(value)) {
+                // Special handling for dns object - merge array fields instead of overwriting
+                this.config[key] = this.mergeDnsConfig(this.config[key], value);
+                this.appliedOverrideKeys.add(key);
             } else {
                 this.config[key] = deepCopy(value);
                 this.appliedOverrideKeys.add(key);
             }
         });
+
+        // Store user proxy-groups for later merge (after system groups are created)
+        if (Array.isArray(overrides['proxy-groups'])) {
+            this.pendingUserProxyGroups = this.pendingUserProxyGroups || [];
+            this.pendingUserProxyGroups.push(...overrides['proxy-groups']);
+        }
+    }
+
+    /**
+     * Merge DNS configuration with intelligent array merging
+     * Arrays like nameserver, fallback, fake-ip-filter are merged instead of overwritten
+     * @param {object} existing - Existing DNS config
+     * @param {object} incoming - Incoming DNS config to merge
+     * @returns {object} - Merged DNS config
+     */
+    mergeDnsConfig(existing, incoming) {
+        if (!existing || typeof existing !== 'object') {
+            return deepCopy(incoming);
+        }
+
+        const result = deepCopy(existing);
+        // Array fields that should be merged instead of overwritten
+        const mergeableArrayKeys = new Set(['nameserver', 'fallback', 'fake-ip-filter']);
+
+        Object.entries(incoming).forEach(([key, value]) => {
+            if (mergeableArrayKeys.has(key) && Array.isArray(value)) {
+                if (Array.isArray(result[key])) {
+                    // Merge arrays and deduplicate
+                    result[key] = [...new Set([...result[key], ...value])];
+                } else {
+                    result[key] = deepCopy(value);
+                }
+            } else if (key === 'nameserver-policy' && typeof value === 'object' && !Array.isArray(value)) {
+                // Merge nameserver-policy object
+                result[key] = { ...(result[key] || {}), ...deepCopy(value) };
+            } else {
+                result[key] = deepCopy(value);
+            }
+        });
+
+        return result;
     }
 
     hasConfigOverride(key) {
         return this.appliedOverrideKeys?.has(key);
+    }
+
+    getSubscriptionUserinfo() {
+        return this.subscriptionUserinfo;
     }
 
     getOutboundsList() {
@@ -223,6 +381,20 @@ export class BaseConfigBuilder {
         this.addOutboundGroups(outbounds, proxyList);
         this.addCustomRuleGroups(proxyList);
         this.addFallBackGroup(proxyList);
+
+        // Merge user-defined proxy-groups after system groups are created
+        if (this.pendingUserProxyGroups && this.pendingUserProxyGroups.length > 0) {
+            this.mergeUserProxyGroups(this.pendingUserProxyGroups);
+        }
+    }
+
+    /**
+     * Merge user-defined proxy groups with system-generated ones
+     * Override in child classes to implement format-specific merge logic
+     * @param {Array} userGroups - User-defined proxy groups
+     */
+    mergeUserProxyGroups(userGroups) {
+        // Default: no-op. Child classes implement format-specific merge.
     }
 
     generateRules() {

@@ -1,12 +1,28 @@
 #:schema node_modules/wrangler/config-schema.json
 name = "sublink-worker"
 main = "src/worker.jsx"
+account_id = "5f0f967f8a7514a497861b1e1f7147e5"
 compatibility_date = "2024-07-24"
 compatibility_flags = ["nodejs_compat"]
+workers_dev = false
+preview_urls = false
+keep_vars = true
+routes = [
+  { pattern = "sublink.newstardev.me", custom_domain = true }
+]
 
 kv_namespaces = [
-  { binding = "SUBLINK_KV", id = "f2612cda27eb48ccb87d89285383f041" }
+  { binding = "SUBLINK_KV", id = "0c380d4aa2fb4f6bac3b0e1fabcadb6c" }
 ]
 
 [assets]
 directory = "./public"
+
+[observability]
+enabled = true
+head_sampling_rate = 0.1
+
+[observability.logs]
+enabled = true
+head_sampling_rate = 0.1
+invocation_logs = true

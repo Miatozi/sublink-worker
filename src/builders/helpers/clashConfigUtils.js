@@ -3,6 +3,15 @@ export function emitClashRules(rules = [], translator) {
         throw new Error('emitClashRules requires a translator function');
     }
     const results = [];
+
+    rules
+        .filter(rule => Array.isArray(rule.src_ip_cidr) && rule.src_ip_cidr.length > 0)
+        .forEach(rule => {
+            rule.src_ip_cidr.forEach(cidr => {
+                if (!cidr) return;
+                results.push(`SRC-IP-CIDR,${cidr},${translator('outboundNames.' + rule.outbound)}`);
+            });
+        });
     rules
         .filter(rule => Array.isArray(rule.domain_suffix) && rule.domain_suffix.length > 0)
         .forEach(rule => {
@@ -31,7 +40,7 @@ export function emitClashRules(rules = [], translator) {
         .filter(rule => Array.isArray(rule.ip_rules) && rule.ip_rules[0])
         .forEach(rule => {
             rule.ip_rules.forEach(ip => {
-                results.push(`RULE-SET,${ip},${translator('outboundNames.' + rule.outbound)},no-resolve`);
+                results.push(`RULE-SET,${ip}-ip,${translator('outboundNames.' + rule.outbound)},no-resolve`);
             });
         });
 
@@ -61,15 +70,23 @@ export function sanitizeClashProxyGroups(config) {
 
     config['proxy-groups'] = groups.map(group => {
         if (!group || !Array.isArray(group.proxies)) return group;
-        const filtered = group.proxies
+        const normalizedProxies = group.proxies
             .map(x => typeof x === 'string' ? x.trim() : x)
-            .filter(x => typeof x === 'string' && validNames.has(normalize(x)));
+            .filter(x => typeof x === 'string');
         const seen = new Set();
-        const deduped = filtered.filter(value => {
+        const deduped = normalizedProxies.filter(value => {
             if (seen.has(value)) return false;
             seen.add(value);
             return true;
         });
-        return { ...group, proxies: deduped };
+
+        // If group uses providers, we cannot validate provider node names at build time.
+        // Skip filtering to avoid incorrectly removing valid provider nodes.
+        if (Array.isArray(group.use) && group.use.length > 0) {
+            return { ...group, proxies: deduped };
+        }
+
+        const filtered = deduped.filter(x => validNames.has(normalize(x)));
+        return { ...group, proxies: filtered };
     });
 }
